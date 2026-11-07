@@ -5,24 +5,33 @@ const Theme = require("../models/Theme");
 const crypto = require("crypto");
 const logger = require("../utils/logger");
 const { assertPublicUrl } = require("../utils/ssrf");
+const {
+    assertNoUrlCredentials,
+    buildSourceHeaders,
+    buildSourceUrl,
+    decryptSourceToken,
+    describeIndexFailure,
+    encryptSourceToken,
+    isSameOrigin,
+    toPublicSource,
+} = require("../utils/sourceRequest");
 
-module.exports.validateSourceUrl = async (url) => {
+module.exports.validateSourceUrl = async (url, authToken = null) => {
     try {
         const baseUrl = url.replace(/\/$/, "");
-        const indexUrl = `${baseUrl}/NTINDEX`;
+        assertNoUrlCredentials(baseUrl);
+        const indexUrl = buildSourceUrl(baseUrl, "NTINDEX");
 
         await assertPublicUrl(indexUrl);
 
         const response = await fetch(indexUrl, {
             method: "GET",
-            headers: {
-                "User-Agent": "Nexterm/1.0",
-            },
+            headers: buildSourceHeaders(indexUrl, authToken),
             signal: AbortSignal.timeout(10000),
         });
 
         if (!response.ok) {
-            return { valid: false, error: `Failed to fetch NTINDEX: HTTP ${response.status}` };
+            return { valid: false, error: describeIndexFailure(response.status, Boolean(authToken)) };
         }
 
         const indexContent = await response.text();
@@ -88,7 +97,7 @@ const reconstructSnippetFile = (snippet) => {
 };
 
 module.exports.createSource = async (sourceData) => {
-    const { name, url } = sourceData;
+    const { name, url, authToken } = sourceData;
 
     const normalizedUrl = url.replace(/\/$/, "");
 
@@ -97,12 +106,17 @@ module.exports.createSource = async (sourceData) => {
         return { code: 409, message: "A source with this URL already exists" };
     }
 
-    const validation = await module.exports.validateSourceUrl(normalizedUrl);
+    const validation = await module.exports.validateSourceUrl(normalizedUrl, authToken || null);
     if (!validation.valid) {
         return { code: 400, message: `Invalid source URL: ${validation.error}` };
     }
 
-    const source = await Source.create({ name, url: normalizedUrl, enabled: true });
+    const source = await Source.create({
+        name,
+        url: normalizedUrl,
+        enabled: true,
+        ...encryptSourceToken(authToken),
+    });
 
     await module.exports.syncSource(source.id);
 
@@ -110,7 +124,8 @@ module.exports.createSource = async (sourceData) => {
 };
 
 module.exports.listSources = async () => {
-    return await Source.findAll({ order: [["name", "ASC"]] });
+    const sources = await Source.findAll({ order: [["name", "ASC"]] });
+    return sources.map(toPublicSource);
 };
 
 module.exports.getSource = async (sourceId) => {
@@ -118,7 +133,7 @@ module.exports.getSource = async (sourceId) => {
     if (!source) {
         return { code: 404, message: "Source not found" };
     }
-    return source;
+    return toPublicSource(source);
 };
 
 module.exports.updateSource = async (sourceId, updates) => {
@@ -127,13 +142,18 @@ module.exports.updateSource = async (sourceId, updates) => {
         return { code: 404, message: "Source not found" };
     }
 
-    const { name, url, enabled } = updates;
+    const { name, url, enabled, authToken } = updates;
     const updateData = {};
 
     if (name !== undefined) updateData.name = name;
     if (enabled !== undefined) updateData.enabled = enabled;
 
-    if (url !== undefined && url !== source.url) {
+    // undefined keeps the stored token, a string replaces it, null or "" removes it
+    const tokenChanged = authToken !== undefined;
+    const urlChanged = url !== undefined && url !== source.url;
+    let nextUrl = source.url;
+
+    if (urlChanged) {
         const normalizedUrl = url.replace(/\/$/, "");
 
         const existingSource = await Source.findOne({
@@ -143,21 +163,41 @@ module.exports.updateSource = async (sourceId, updates) => {
             return { code: 409, message: "A source with this URL already exists" };
         }
 
-        const validation = await module.exports.validateSourceUrl(normalizedUrl);
+        // A stored token must never be sent to another host than the one it was saved for
+        if (source.authToken && !tokenChanged && !isSameOrigin(normalizedUrl, source.url)) {
+            return {
+                code: 400,
+                message: "Changing the host of a source with an access token requires entering the token again (or removing it)",
+            };
+        }
+
+        nextUrl = normalizedUrl;
+    }
+
+    if (urlChanged || tokenChanged) {
+        let nextToken;
+        try {
+            nextToken = tokenChanged ? (authToken || null) : decryptSourceToken(source);
+        } catch (error) {
+            return { code: 400, message: error.message };
+        }
+
+        const validation = await module.exports.validateSourceUrl(nextUrl, nextToken);
         if (!validation.valid) {
             return { code: 400, message: `Invalid source URL: ${validation.error}` };
         }
 
-        updateData.url = normalizedUrl;
+        if (urlChanged) updateData.url = nextUrl;
+        if (tokenChanged) Object.assign(updateData, encryptSourceToken(authToken));
     }
 
     await Source.update(updateData, { where: { id: sourceId } });
 
-    if (updateData.url) {
+    if (urlChanged || tokenChanged) {
         await module.exports.syncSource(sourceId);
     }
 
-    return await Source.findByPk(sourceId);
+    return toPublicSource(await Source.findByPk(sourceId));
 };
 
 module.exports.deleteSource = async (sourceId) => {
@@ -190,7 +230,9 @@ module.exports.syncSource = async (sourceId) => {
     try {
         logger.info(`Syncing source: ${source.name} (${source.url})`);
 
-        const validation = await module.exports.validateSourceUrl(source.url);
+        const authToken = decryptSourceToken(source);
+
+        const validation = await module.exports.validateSourceUrl(source.url, authToken);
         if (!validation.valid) {
             await Source.update({
                 lastSyncStatus: "error",
@@ -234,7 +276,7 @@ module.exports.syncSource = async (sourceId) => {
                 continue;
             }
 
-            const content = await fetchSourceFile(source.url, indexSnippet.path);
+            const content = await fetchSourceFile(source.url, indexSnippet.path, authToken);
             if (!content) {
                 incompleteFetches++;
                 logger.warn(`Failed to fetch snippet: ${indexSnippet.path}`);
@@ -289,7 +331,7 @@ module.exports.syncSource = async (sourceId) => {
                 continue;
             }
 
-            const content = await fetchSourceFile(source.url, indexScript.path);
+            const content = await fetchSourceFile(source.url, indexScript.path, authToken);
             if (!content) {
                 incompleteFetches++;
                 logger.warn(`Failed to fetch script: ${indexScript.path}`);
@@ -344,7 +386,7 @@ module.exports.syncSource = async (sourceId) => {
                 continue;
             }
 
-            const content = await fetchSourceFile(source.url, indexTheme.path);
+            const content = await fetchSourceFile(source.url, indexTheme.path, authToken);
             if (!content) {
                 incompleteFetches++;
                 logger.warn(`Failed to fetch theme: ${indexTheme.path}`);
@@ -434,15 +476,13 @@ module.exports.syncAllSources = async () => {
     }
 };
 
-const fetchSourceFile = async (baseUrl, path) => {
+const fetchSourceFile = async (baseUrl, path, authToken = null) => {
     try {
-        const url = `${baseUrl}/${path}`;
+        const url = buildSourceUrl(baseUrl, path, { restrictToBase: Boolean(authToken) });
         await assertPublicUrl(url);
         const response = await fetch(url, {
             method: "GET",
-            headers: {
-                "User-Agent": "Nexterm/1.0",
-            },
+            headers: buildSourceHeaders(url, authToken),
             signal: AbortSignal.timeout(30000),
         });
 

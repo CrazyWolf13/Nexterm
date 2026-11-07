@@ -39,4 +39,18 @@ module.exports = db.define("sources", {
         allowNull: false,
         defaultValue: 0,
     },
+    // Optional access token for private repositories, encrypted at rest (AES-256-GCM).
+    // Never decrypted by a hook on purpose: it is only read while fetching, see sourceRequest.js
+    authToken: {
+        type: Sequelize.TEXT,
+        allowNull: true,
+    },
+    authTokenIV: {
+        type: Sequelize.STRING,
+        allowNull: true,
+    },
+    authTokenAuthTag: {
+        type: Sequelize.STRING,
+        allowNull: true,
+    },
 }, { freezeTableName: true, createdAt: true, updatedAt: true });

@@ -23,14 +23,17 @@ import {
     mdiLoading,
     mdiFormTextbox,
     mdiLink,
+    mdiKeyOutline,
 } from "@mdi/js";
+
+const EMPTY_FORM = { name: "", url: "", enabled: true, authToken: "", removeToken: false };
 
 export const Sources = () => {
     const { t } = useTranslation();
     const [sources, setSources] = useState([]);
     const [dialogOpen, setDialogOpen] = useState(false);
     const [editSource, setEditSource] = useState(null);
-    const [formData, setFormData] = useState({ name: "", url: "", enabled: true });
+    const [formData, setFormData] = useState(EMPTY_FORM);
     const [validating, setValidating] = useState(false);
     const [validationResult, setValidationResult] = useState(null);
     const [saving, setSaving] = useState(false);
@@ -53,14 +56,14 @@ export const Sources = () => {
 
     const openCreateDialog = () => {
         setEditSource(null);
-        setFormData({ name: "", url: "", enabled: true });
+        setFormData(EMPTY_FORM);
         setValidationResult(null);
         setDialogOpen(true);
     };
 
     const openEditDialog = (source) => {
         setEditSource(source);
-        setFormData({ name: source.name, url: source.url, enabled: source.enabled });
+        setFormData({ name: source.name, url: source.url, enabled: source.enabled, authToken: "", removeToken: false });
         setValidationResult(null);
         setDialogOpen(true);
     };
@@ -68,18 +71,24 @@ export const Sources = () => {
     const closeDialog = () => {
         setDialogOpen(false);
         setEditSource(null);
-        setFormData({ name: "", url: "", enabled: true });
+        setFormData(EMPTY_FORM);
         setValidationResult(null);
     };
 
     const validateUrl = async () => {
         if (!formData.url) return;
 
+        // The saved token never leaves the server, so a source that relies on it is checked when saving
+        if (editSource?.hasAuthToken && !formData.authToken && !formData.removeToken) return;
+
         setValidating(true);
         setValidationResult(null);
 
         try {
-            const result = await postRequest("sources/validate", { url: formData.url });
+            const result = await postRequest("sources/validate", {
+                url: formData.url,
+                ...(formData.authToken && { authToken: formData.authToken }),
+            });
             setValidationResult(result);
         } catch (error) {
             setValidationResult({
@@ -101,10 +110,19 @@ export const Sources = () => {
 
         try {
             if (editSource) {
-                await patchRequest(`sources/${editSource.id}`, formData);
+                const payload = { name: formData.name, url: formData.url, enabled: formData.enabled };
+                // Omitting authToken keeps the saved token, null removes it
+                if (formData.removeToken) payload.authToken = null;
+                else if (formData.authToken) payload.authToken = formData.authToken;
+
+                await patchRequest(`sources/${editSource.id}`, payload);
                 sendToast(t("settings.sources.messages.updated"), "");
             } else {
-                await postRequest("sources", { name: formData.name, url: formData.url });
+                await postRequest("sources", {
+                    name: formData.name,
+                    url: formData.url,
+                    ...(formData.authToken && { authToken: formData.authToken }),
+                });
                 sendToast(t("settings.sources.messages.created"), "");
             }
             closeDialog();
@@ -265,6 +283,26 @@ export const Sources = () => {
                         />
                     </div>
 
+                    <div className="form-group">
+                        <label>{t("settings.sources.dialog.authToken")}</label>
+                        <Input
+                            type="password"
+                            icon={mdiKeyOutline}
+                            autoComplete="new-password"
+                            value={formData.authToken}
+                            setValue={(value) => {
+                                setFormData({ ...formData, authToken: value, removeToken: false });
+                                setValidationResult(null);
+                            }}
+                            onBlur={validateUrl}
+                            disabled={formData.removeToken}
+                            placeholder={editSource?.hasAuthToken
+                                ? t("settings.sources.dialog.authTokenSavedPlaceholder")
+                                : t("settings.sources.dialog.authTokenPlaceholder")}
+                        />
+                        <p className="form-hint">{t("settings.sources.dialog.authTokenHint")}</p>
+                    </div>
+
                     {validating && (
                         <div className="validation-result loading">
                             <Icon path={mdiLoading} spin={1} />
@@ -284,6 +322,24 @@ export const Sources = () => {
                             ) : (
                                 validationResult.error
                             )}
+                        </div>
+                    )}
+
+                    {editSource?.hasAuthToken && (
+                        <div className="toggle-row">
+                            <div className="toggle-label">
+                                <h4>{t("settings.sources.dialog.removeToken")}</h4>
+                                <p>{t("settings.sources.dialog.removeTokenDescription")}</p>
+                            </div>
+                            <ToggleSwitch
+                                checked={formData.removeToken}
+                                onChange={(checked) => setFormData({
+                                    ...formData,
+                                    removeToken: checked,
+                                    authToken: checked ? "" : formData.authToken,
+                                })}
+                                id="source-remove-token"
+                            />
                         </div>
                     )}
 

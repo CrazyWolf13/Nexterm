@@ -60,18 +60,18 @@ app.get("/:sourceId", async (req, res) => {
 /**
  * POST /sources/validate
  * @summary Validate Source URL
- * @description Validates a source URL by checking if NTINDEX is accessible and valid
+ * @description Validates a source URL by checking if NTINDEX is accessible and valid. An optional authToken is sent as a Bearer token (for private repositories) and is never stored by this endpoint
  * @tags Sources
  * @produces application/json
  * @security BearerAuth
- * @param {object} request.body.required - URL to validate
+ * @param {object} request.body.required - URL to validate (and optionally an authToken)
  * @return {object} 200 - Validation result
  */
 app.post("/validate", async (req, res) => {
     if (validateSchema(res, validateUrlValidation, req.body)) return;
 
     try {
-        const result = await validateSourceUrl(req.body.url);
+        const result = await validateSourceUrl(req.body.url, req.body.authToken || null);
         if (result.valid) {
             res.json({ 
                 valid: true, 
@@ -90,7 +90,7 @@ app.post("/validate", async (req, res) => {
 /**
  * POST /sources
  * @summary Create New Source
- * @description Creates a new snippet/script source and performs initial sync
+ * @description Creates a new snippet/script source and performs initial sync. An optional authToken (e.g. a GitHub personal access token) is stored encrypted, sent as a Bearer token and never returned by the API
  * @tags Sources
  * @produces application/json
  * @security BearerAuth
@@ -114,7 +114,7 @@ app.post("/", async (req, res) => {
 /**
  * PATCH /sources/:sourceId
  * @summary Update Source
- * @description Updates an existing source's name, URL, or enabled status
+ * @description Updates an existing source's name, URL, enabled status, or access token. Omit authToken to keep the stored token, send an empty string or null to remove it
  * @tags Sources
  * @produces application/json
  * @security BearerAuth
